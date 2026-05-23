@@ -1,9 +1,12 @@
 package com.taller.ecommerce.service;
 
+import com.taller.ecommerce.config.RabbitMQConfig;
 import com.taller.ecommerce.dto.ItemOrdenRequestDTO;
 import com.taller.ecommerce.dto.ItemOrdenResponseDTO;
 import com.taller.ecommerce.dto.OrdenRequestDTO;
 import com.taller.ecommerce.dto.OrdenResponseDTO;
+import com.taller.ecommerce.events.ItemEventDTO;
+import com.taller.ecommerce.events.OrderCreatedEvent;
 import com.taller.ecommerce.exception.StockInsuficienteException;
 import com.taller.ecommerce.model.ItemOrden;
 import com.taller.ecommerce.model.Orden;
@@ -13,8 +16,12 @@ import com.taller.ecommerce.repository.ItemOrdenRepository;
 import com.taller.ecommerce.repository.OrdenRepository;
 import com.taller.ecommerce.repository.ProductoRepository;
 import com.taller.ecommerce.repository.UsuarioRepository;
+import org.springframework.amqp.core.AmqpTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
 
 import java.time.LocalDateTime;
 import java.util.ArrayList;
@@ -27,17 +34,23 @@ public class OrdenService {
     private final OrdenRepository ordenRepository;
     private final ItemOrdenRepository itemOrdenRepository;
     private final AuditoriaService auditoriaService;
+    private final AmqpTemplate amqpTemplate;
+    private final ObjectMapper objectMapper;
 
     public OrdenService(UsuarioRepository usuarioRepository,
                         ProductoRepository productoRepository,
                         OrdenRepository ordenRepository,
                         ItemOrdenRepository itemOrdenRepository,
-                        AuditoriaService auditoriaService) {
+                        AuditoriaService auditoriaService,
+                        AmqpTemplate amqpTemplate,
+                        ObjectMapper objectMapper) {
         this.usuarioRepository = usuarioRepository;
         this.productoRepository = productoRepository;
         this.ordenRepository = ordenRepository;
         this.itemOrdenRepository = itemOrdenRepository;
         this.auditoriaService = auditoriaService;
+        this.amqpTemplate = amqpTemplate;
+        this.objectMapper = objectMapper;
     }
 
     @Transactional
@@ -49,7 +62,7 @@ public class OrdenService {
         Orden orden = new Orden();
         orden.setUsuario(usuario);
         orden.setFecha(LocalDateTime.now());
-        orden.setEstado("CREADA");
+        orden.setEstado("PENDIENTE");
 
         List<ItemOrden> items = new ArrayList<>();
         double total = 0.0;
@@ -78,6 +91,33 @@ public class OrdenService {
         }
         orden.setTotal(total);
         ordenRepository.save(orden);
+        List<ItemEventDTO> itemEvents = items.stream()
+                .map(i -> new ItemEventDTO(
+                        i.getProducto().getId(),
+                        i.getCantidad(),
+                        i.getPrecioUnitario()
+                ))
+                .toList();
+
+        OrderCreatedEvent evento = new OrderCreatedEvent(
+                orden.getId(),
+                usuario.getId(),
+                usuario.getCorreo(),
+                orden.getTotal(),
+                itemEvents
+        );
+
+        try {
+            String json = objectMapper.writeValueAsString(evento);
+            amqpTemplate.convertAndSend(
+                    RabbitMQConfig.ORDEN_EXCHANGE,
+                    RabbitMQConfig.ORDEN_CREADA_KEY,
+                    json
+            );
+        } catch (JsonProcessingException e) {
+            throw new RuntimeException("Error al publicar evento OrderCreated", e);
+        }
+
         auditoriaService.registrar(
                 "CREAR_ORDEN",
                 "ORDEN",
@@ -85,6 +125,8 @@ public class OrdenService {
                 usuario.getCorreo(),
                 "Orden creada correctamente"
         );
+
+
         itemOrdenRepository.saveAll(items);
     }
 
@@ -109,4 +151,6 @@ public class OrdenService {
                 })
                 .toList();
     }
+
+
 }
